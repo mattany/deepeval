@@ -64,6 +64,7 @@ class GEval(BaseMetric):
         threshold: float = 0.5,
         async_mode: bool = True,
         strict_mode: bool = False,
+        use_logprobs_scores: bool = True,
         verbose_mode: bool = False,
         _include_g_eval_suffix: bool = True,
     ):
@@ -92,6 +93,7 @@ class GEval(BaseMetric):
         self.evaluation_steps = evaluation_steps
         self.threshold = 1 if strict_mode else threshold
         self.strict_mode = strict_mode
+        self.use_logprobs_scores = use_logprobs_scores
         self.async_mode = async_mode
         self.verbose_mode = verbose_mode
         self._include_g_eval_suffix = _include_g_eval_suffix
@@ -221,47 +223,41 @@ class GEval(BaseMetric):
                 data = trimAndLoadJson(res, self)
                 return data["steps"]
 
+    def _get_score_and_reason(self, res: AIMessage) -> tuple[int | float, str]:
+        data = trimAndLoadJson(res.content, self)
+        reason = data["reason"]
+        score = data["score"]
+        if self.strict_mode:
+            return score, reason
+        if self.use_logprobs_scores:
+            weighted_summed_score = self.generate_weighted_summed_score(
+                score, res
+            )
+            return weighted_summed_score, reason
+        else:
+            return score, reason
+
     async def _a_evaluate(
         self, test_case: LLMTestCase
     ) -> Tuple[Union[int, float], str]:
-        text = """"""
-        for param in self.evaluation_params:
-            value = getattr(test_case, param.value)
-            text += f"{G_EVAL_PARAMS[param]}:\n{value} \n\n"
+        prompt = self._get_prompt(test_case)
 
-        g_eval_params_str = construct_g_eval_params_string(
-            self.evaluation_params
-        )
-        prompt = GEvalTemplate.generate_evaluation_results(
-            evaluation_steps=self.number_evaluation_steps(),
-            text=text,
-            parameters=g_eval_params_str,
-        )
-
-        try:
+        if hasattr(self.model, "a_generate_raw_response"):
             # Don't have to check for using native model
             # since generate raw response only exist for deepeval's native model
-            res, cost = await self.model.a_generate_raw_response(
-                prompt, logprobs=True, top_logprobs=20
-            )
-            self.evaluation_cost += cost
-            data = trimAndLoadJson(res.content, self)
-
-            reason = data["reason"]
-            score = data["score"]
-            if self.strict_mode:
-                return score, reason
-
-            try:
-                weighted_summed_score = self.generate_weighted_summed_score(
-                    score, res
+            if self.use_logprobs_scores:
+                res, cost = await self.model.a_generate_raw_response(
+                    prompt, logprobs=True, top_logprobs=20
                 )
-                return weighted_summed_score, reason
-            except:
-                return score, reason
-        except (
-            AttributeError
-        ):  # This catches the case where a_generate_raw_response doesn't exist.
+            else:
+                res, cost = await self.model.a_generate_raw_response(
+                    prompt, logprobs=False
+                )
+            self.evaluation_cost += cost
+            return self._get_score_and_reason(res)
+        else:
+            if self.use_logprobs_scores:
+                raise ValueError("The chosen model doesn't support 'use_logprobs_scores'. Please initialize GEval with use_logprobs_scores=False.")
             if self.using_native_model:
                 res, cost = await self.model.a_generate(prompt)
                 self.evaluation_cost += cost
@@ -278,43 +274,36 @@ class GEval(BaseMetric):
                     data = trimAndLoadJson(res, self)
                     return data["score"], data["reason"]
 
-    def evaluate(self, test_case: LLMTestCase) -> Tuple[Union[int, float], str]:
+    def _get_prompt(self, test_case):
         text = """"""
         for param in self.evaluation_params:
             value = getattr(test_case, param.value)
-            text += f"{param.value}: {value} \n\n"
-
+            text += f"{G_EVAL_PARAMS[param]}:\n{value} \n\n"
         g_eval_params_str = construct_g_eval_params_string(
             self.evaluation_params
         )
-
         prompt = GEvalTemplate.generate_evaluation_results(
             evaluation_steps=self.number_evaluation_steps(),
             text=text,
             parameters=g_eval_params_str,
         )
+        return prompt
 
-        try:
-            res, cost = self.model.generate_raw_response(
-                prompt, logprobs=True, top_logprobs=20
-            )
-            self.evaluation_cost += cost
-            data = trimAndLoadJson(res.content, self)
+    def evaluate(self, test_case: LLMTestCase) -> Tuple[Union[int, float], str]:
+        prompt = self._get_prompt(test_case)
 
-            reason = data["reason"]
-            score = data["score"]
-            if self.strict_mode:
-                return score, reason
-
-            try:
-                weighted_summed_score = self.generate_weighted_summed_score(
-                    score, res
+        if hasattr(self.model, "generate_raw_response"):
+            if self.use_logprobs_scores:
+                res, cost = self.model.generate_raw_response(
+                    prompt, logprobs=True, top_logprobs=20
                 )
-                return weighted_summed_score, reason
-            except:
-                return score, reason
-        except AttributeError:
-            # This catches the case where a_generate_raw_response doesn't exist.
+            else:
+                res, cost = self.model.generate_raw_response(
+                    prompt, logprobs=False
+                )
+            self.evaluation_cost += cost
+            return self._get_score_and_reason(res)
+        else:
             if self.using_native_model:
                 res, cost = self.model.generate(prompt)
                 self.evaluation_cost += cost
